@@ -79,7 +79,7 @@ class BackgroundScanner extends TimedJob {
 	public function run($args): void {
 		// locate files that are not checked yet
 		try {
-			$result = $this->getUnscannedFiled();
+			$result = $this->getUnscannedFiles();
 		} catch(\Exception $e) {
 			$this->logger->logException($e);
 			return;
@@ -172,6 +172,50 @@ class BackgroundScanner extends TimedJob {
 				$this->logger->error( __METHOD__ . ', exception: ' . $e->getMessage(), ['app' => 'files_antivirus']);
 			}
 		}
+
+
+		// Run for files that have been scanned in the past. Just start to rescan them as the virus definitaions might have been updated
+		try {
+			$result = $this->getOutdatedFiles();
+		} catch(\Exception $e) {
+			$this->logger->logException($e);
+			return;
+		}
+
+		while (($row = $result->fetch()) && $cnt < $batchSize) {
+			try {
+				$fileId = $row['fileid'];
+				$users = $this->getUserWithAccessToStorage((int)$row['storage']);
+
+				foreach ($users as $user) {
+					/** @var IUser $owner */
+					$owner = $this->userManager->get($user['user_id']);
+					if (!$owner instanceof IUser){
+						continue;
+					}
+
+					$userFolder = $this->rootFolder->getUserFolder($owner->getUID());
+					$files = $userFolder->getById($fileId);
+
+					if ($files === []) {
+						continue;
+					}
+
+					$file = array_pop($files);
+					if ($file instanceof File) {
+						$this->scanOneFile($file);
+					} else {
+						$this->logger->error('Tried to scan non file');
+					}
+
+					// increased only for successfully scanned files
+					$cnt++;
+					break;
+				}
+			} catch (\Exception $e) {
+				$this->logger->error( __METHOD__ . ', exception: ' . $e->getMessage(), ['app' => 'files_antivirus']);
+			}
+		}
 	}
 
 	protected function getBatchSize(): int {
@@ -212,7 +256,7 @@ class BackgroundScanner extends TimedJob {
 		return $data;
 	}
 
-	protected function getUnscannedFiled() {
+	protected function getUnscannedFiles() {
 		$dirMimeTypeId = $this->mimeTypeLoader->getId('httpd/unix-directory');
 
 		$qb1 = $this->db->getQueryBuilder();
@@ -238,6 +282,20 @@ class BackgroundScanner extends TimedJob {
 			->join('fc', 'files_antivirus', 'fa', $qb->expr()->eq('fc.fileid', 'fa.fileid'))
 			->andWhere($qb->expr()->lt('fa.check_time', 'fc.mtime'))
 			->andWhere($this->getSizeLimitExpression($qb))
+			->setMaxResults($this->getBatchSize() * 10);
+
+		return $qb->execute();
+	}
+
+	protected function getOutdatedFiles() {
+		// We do not want to keep scanning the same files. So only scan them once per 28 days at most.
+		$yesterday = time() - (28 * 24 * 60 * 60);
+
+		$qb = $this->db->getQueryBuilder();
+		$qb->select('fileid')
+			->from('files_antivirus')
+			->andWhere($qb->expr()->lt('check_time', $qb->createNamedParameter($yesterday)))
+			->orderBy('check_time', 'ASC')
 			->setMaxResults($this->getBatchSize() * 10);
 
 		return $qb->execute();
